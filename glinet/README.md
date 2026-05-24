@@ -1,69 +1,141 @@
 # GL.iNet Setup Guide
 
+## Architecture
+
+```
+PicoBrew Machine
+    ↓
+GL.iNet Wi-Fi
+    ↓ DNS: picobrew.com → 192.168.8.1 (router itself)
+GL.iNet Router
+    ↓ nginx HTTPS reverse proxy (self-signed cert)
+https://www.piconew.com
+```
+
+The router intercepts PicoBrew traffic locally and proxies it to PicoNew. Your home internet is unaffected.
+
 ## What you need
 
 - Any GL.iNet router running OpenWrt (tested with GL-SFT1200, GL-MT300N-V2, GL-AXT1800)
   - GL-SFT1200 (~$40 at Walmart) — recommended
   - GL-MT300N-V2 (~$25) — budget option, single-band
-- An ethernet cable or your home Wi-Fi to connect the GL.iNet to the internet
+- Ethernet cable or home Wi-Fi to connect GL.iNet to the internet
+- Mac, Linux, or Windows 10/11 computer to SSH into the router
 
 ## Step 1 — Connect GL.iNet to your home network
 
-**Option A — Ethernet (most reliable):**
-Plug a cable from your home router's LAN port into the GL.iNet's WAN port.
+**Option A — Ethernet (recommended):**
+Plug a cable from your home router's LAN port into the GL.iNet WAN port.
 
 **Option B — Wi-Fi repeater:**
-In the GL.iNet admin panel → Internet → Repeater → connect to your home Wi-Fi.
+Open GL.iNet admin at `http://192.168.8.1` → Internet → Repeater → connect to your home Wi-Fi.
 
-## Step 2 — Find PicoNew's IP address
+## Step 2 — SSH into the router
 
-On any computer, run:
+Connect your computer to the GL.iNet Wi-Fi, then open Terminal (Mac/Linux) or PowerShell/CMD (Windows):
 
 ```bash
-dig +short piconew.com
+ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa root@192.168.8.1
 ```
 
-Or use an online tool: search "DNS lookup piconew.com". Note the IP address returned (e.g. `76.76.21.21`).
+Password = your GL.iNet admin password (set on first login).
 
-## Step 3 — Configure dnsmasq
+> **Note:** The `HostKeyAlgorithms` flag is required on modern macOS and Windows 10/11 — GL.iNet uses legacy ssh-rsa which newer OpenSSH hides by default.
 
-Open the GL.iNet admin panel at `http://192.168.8.1` (default).
+## Step 3 — Configure DNS to point picobrew.com to the router
 
-**Option A — Web UI (no SSH needed):**
-1. Go to **Advanced** → **Custom DNS**
-2. Paste the contents of [`dnsmasq.conf`](dnsmasq.conf), replacing `PICONEW_IP` with the IP from Step 2
-3. Save and apply
+In the SSH session:
 
-**Option B — SSH:**
 ```bash
-ssh root@192.168.8.1
-echo "address=/picobrew.com/PICONEW_IP" >> /etc/dnsmasq.conf
-echo "address=/.picobrew.com/PICONEW_IP" >> /etc/dnsmasq.conf
+echo "address=/picobrew.com/192.168.8.1" >> /etc/dnsmasq.conf
+echo "address=/.picobrew.com/192.168.8.1" >> /etc/dnsmasq.conf
 /etc/init.d/dnsmasq restart
 ```
 
-## Step 4 — Connect PicoBrew to GL.iNet Wi-Fi
-
-On your PicoBrew machine, connect to the GL.iNet's Wi-Fi network (default name is `GL-XXXX-XXX`).
-
-Optionally rename it to something like `PicoNew Setup` in GL.iNet admin → Wireless → SSID.
-
-## Step 5 — Verify
-
-From a device connected to the GL.iNet network:
+Verify from any device on the GL.iNet Wi-Fi:
 
 ```bash
-nslookup picobrew.com 192.168.8.1
+nslookup www.picobrew.com
+# Expected: Address: 192.168.8.1
 ```
 
-The returned IP should match the PicoNew IP from Step 2. If it does, your PicoBrew will now connect to PicoNew.
+## Step 4 — Install nginx with SSL support
+
+```bash
+opkg update
+opkg install nginx-ssl
+```
+
+## Step 5 — Generate a self-signed TLS certificate
+
+```bash
+mkdir -p /etc/nginx/certs
+openssl req -x509 -nodes -days 3650 \
+  -newkey rsa:2048 \
+  -keyout /etc/nginx/certs/picobrew.key \
+  -out /etc/nginx/certs/picobrew.crt \
+  -subj "/CN=www.picobrew.com"
+```
+
+> The CN must be `www.picobrew.com` — the PicoBrew machine connects to that hostname.
+
+## Step 6 — Configure nginx reverse proxy
+
+```bash
+cat > /etc/nginx/conf.d/picobrew.conf << 'EOF'
+server {
+    listen 443 ssl;
+    server_name www.picobrew.com picobrew.com;
+
+    ssl_certificate     /etc/nginx/certs/picobrew.crt;
+    ssl_certificate_key /etc/nginx/certs/picobrew.key;
+
+    location / {
+        proxy_pass https://www.piconew.com;
+        proxy_ssl_server_name on;
+        proxy_set_header Host www.piconew.com;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+EOF
+```
+
+Validate and start nginx:
+
+```bash
+nginx -t
+/etc/init.d/nginx restart
+/etc/init.d/nginx enable
+```
+
+## Step 7 — Verify the proxy
+
+From your computer (still on GL.iNet Wi-Fi):
+
+```bash
+curl -vk https://www.picobrew.com
+```
+
+TLS handshake should succeed and return PicoNew content. Test a PicoBrew endpoint:
+
+```bash
+curl -vk "https://www.picobrew.com/Vendors/input.cshtml?type=ZState"
+```
+
+## Step 8 — Connect PicoBrew
+
+On your PicoBrew machine, connect to the GL.iNet Wi-Fi network and power cycle it. It will now connect through PicoNew.
+
+Optionally rename the Wi-Fi SSID to something recognizable: GL.iNet admin → Wireless → SSID.
 
 ## Troubleshooting
 
-**DNS not redirecting:** Make sure you restarted dnsmasq after editing the config (`/etc/init.d/dnsmasq restart`).
+**DNS not redirecting:** Make sure dnsmasq was restarted after editing — `/etc/init.d/dnsmasq restart`.
 
-**PicoBrew not connecting:** Confirm the machine is on the GL.iNet Wi-Fi, not your home Wi-Fi.
+**PicoBrew not connecting:** Confirm the machine is on GL.iNet Wi-Fi, not your home Wi-Fi.
 
-**GL.iNet has no internet:** Check the WAN connection — try switching from repeater to ethernet cable.
+**SSL handshake errors:** Verify the cert CN is exactly `www.picobrew.com` and nginx restarted cleanly (`nginx -t`).
 
-**PicoNew IP changed:** Repeat Steps 2–3 with the new IP. This is rare but possible with cloud deployments.
+**GL.iNet has no internet:** Check WAN connection — try switching from repeater to ethernet cable.
+
+**nginx not installed:** Run `opkg update && opkg install nginx-ssl` again; `opkg update` must succeed first.
